@@ -22,8 +22,7 @@ impl ArtifactManager {
         // Ensure artifacts directory exists
         if !artifacts_dir.exists() {
             fs::create_dir_all(&artifacts_dir)
-                .await
-                .map_err(|e| ExecutorError::IoError(format!("Failed to create artifacts directory: {}", e)))?;
+                .await?;
         }
 
         info!("Initialized artifact manager with directory: {}", artifacts_dir.display());
@@ -180,9 +179,7 @@ impl ArtifactManager {
         file_path: &Path,
         relative_path: &str,
     ) -> Result<Artifact> {
-        let metadata = fs::metadata(file_path)
-            .await
-            .map_err(|e| ExecutorError::IoError(format!("Failed to read file metadata: {}", e)))?;
+        let metadata = fs::metadata(file_path).await?;
 
         // Copy file to artifacts directory
         let artifact_file_name = format!("{}_{}", execution.id, relative_path.replace('/', "_"));
@@ -190,14 +187,10 @@ impl ArtifactManager {
 
         // Ensure parent directory exists
         if let Some(parent) = artifact_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ExecutorError::IoError(format!("Failed to create artifact directory: {}", e)))?;
+            fs::create_dir_all(parent).await?;
         }
 
-        fs::copy(file_path, &artifact_path)
-            .await
-            .map_err(|e| ExecutorError::IoError(format!("Failed to copy artifact file: {}", e)))?;
+        fs::copy(file_path, &artifact_path).await?;
 
         debug!("Created file artifact: {} -> {}", file_path.display(), artifact_path.display());
 
@@ -261,9 +254,7 @@ impl ArtifactManager {
             ));
         }
 
-        let metadata = fs::metadata(output_path)
-            .await
-            .map_err(|e| ExecutorError::IoError(format!("Failed to read compressed file metadata: {}", e)))?;
+        let metadata = fs::metadata(output_path).await?;
 
         Ok(metadata.len())
     }
@@ -340,14 +331,10 @@ impl ArtifactManager {
                 
                 // Ensure target directory exists
                 if let Some(parent) = target_path.parent() {
-                    fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| ExecutorError::IoError(format!("Failed to create target directory: {}", e)))?;
+                    fs::create_dir_all(parent).await?;
                 }
 
-                fs::copy(artifact_path, target_path)
-                    .await
-                    .map_err(|e| ExecutorError::IoError(format!("Failed to extract file artifact: {}", e)))?;
+                fs::copy(artifact_path, target_path).await?;
             }
             ArtifactType::Archive => {
                 // Extract compressed archive
@@ -374,9 +361,7 @@ impl ArtifactManager {
             ArtifactType::Log => {
                 // Copy log file
                 let target_path = target_dir.join(&artifact.name);
-                fs::copy(artifact_path, target_path)
-                    .await
-                    .map_err(|e| ExecutorError::IoError(format!("Failed to extract log artifact: {}", e)))?;
+                fs::copy(artifact_path, target_path).await?;
             }
         }
 

@@ -139,7 +139,7 @@ impl DockerActionExecutor {
                 let result = TaskExecutionResult {
                     success,
                     exit_code,
-                    output: Some(serde_json::Value::Object(output_data.into_iter().collect())),
+                    output: Some(output_data.into_iter().collect()),
                     error_message: if !success {
                         Some(format!("Docker container exited with code: {:?}", exit_code))
                     } else {
@@ -282,7 +282,7 @@ impl ActionExecutor for CheckoutActionExecutor {
         let result = TaskExecutionResult {
             success: true,
             exit_code: Some(0),
-            output: Some(serde_json::Value::Object(output_data.into_iter().collect())),
+            output: Some(output_data.into_iter().collect()),
             error_message: None,
             duration_ms: duration.as_millis() as u64,
             artifacts: vec![
@@ -291,7 +291,7 @@ impl ActionExecutor for CheckoutActionExecutor {
                     path: context.working_directory.clone(),
                     size_bytes: 1024, // Simulated
                     content_type: Some("application/git".to_string()),
-                }
+                }.into()
             ],
         };
 
