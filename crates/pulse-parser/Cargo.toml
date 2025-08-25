@@ -1,0 +1,16 @@
+[package]
+name = "pulse-parser"
+version = "0.1.0"
+edition = "2021"
+description = "YAML workflow definition parser for Pulse"
+
+[dependencies]
+pulse-core = { path = "../pulse-core" }
+
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+regex = "1.10"

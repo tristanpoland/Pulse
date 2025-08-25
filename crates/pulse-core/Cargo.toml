@@ -1,0 +1,13 @@
+[package]
+name = "pulse-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core types and traits for Pulse workflow engine"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }

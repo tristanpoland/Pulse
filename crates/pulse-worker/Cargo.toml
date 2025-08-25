@@ -1,0 +1,33 @@
+[package]
+name = "pulse-worker"
+version = "0.1.0"
+edition = "2021"
+description = "P2P worker node for Pulse workflow engine"
+
+[[bin]]
+name = "pulse-worker"
+path = "src/main.rs"
+
+[dependencies]
+pulse-core = { path = "../pulse-core" }
+pulse-storage = { path = "../pulse-storage" }
+pulse-p2p = { path = "../pulse-p2p" }
+pulse-executor = { path = "../pulse-executor" }
+
+tokio = { workspace = true }
+libp2p = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+config = { workspace = true }
+uuid = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+futures = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }

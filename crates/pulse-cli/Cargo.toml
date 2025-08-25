@@ -1,0 +1,24 @@
+[package]
+name = "pulse-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line interface for Pulse workflow engine"
+
+[[bin]]
+name = "pulse"
+path = "src/main.rs"
+
+[dependencies]
+pulse-core = { path = "../pulse-core" }
+pulse-parser = { path = "../pulse-parser" }
+
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+config = { workspace = true }
+uuid = { workspace = true }

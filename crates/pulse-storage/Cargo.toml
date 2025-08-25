@@ -1,0 +1,21 @@
+[package]
+name = "pulse-storage"
+version = "0.1.0"
+edition = "2021"
+description = "Replicated storage system for Pulse"
+
+[dependencies]
+pulse-core = { path = "../pulse-core" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+sled = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
