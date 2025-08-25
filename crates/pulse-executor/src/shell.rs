@@ -130,7 +130,7 @@ impl ShellExecutor {
                 let result = TaskExecutionResult {
                     success,
                     exit_code,
-                    output: Some(serde_json::Value::Object(output_data.into_iter().collect())),
+                    output: Some(output_data.into_iter().collect()),
                     error_message: if !success {
                         Some(format!("Command exited with code: {:?}", exit_code))
                     } else {
