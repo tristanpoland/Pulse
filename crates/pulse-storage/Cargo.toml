@@ -6,6 +6,7 @@ description = "Replicated storage system for Pulse"
 
 [dependencies]
 pulse-core = { path = "../pulse-core" }
+pulse-p2p = { path = "../pulse-p2p" }
 
 tokio = { workspace = true }
 serde = { workspace = true }

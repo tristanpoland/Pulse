@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use tracing::info;
 use uuid::Uuid;
 
+mod api;
 mod client;
 mod commands;
 mod config;

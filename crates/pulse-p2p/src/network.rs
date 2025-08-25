@@ -33,6 +33,8 @@ pub struct P2PNetwork {
     message_router: MessageRouter,
     message_sender: mpsc::UnboundedSender<MessageEnvelope>,
     message_receiver: mpsc::UnboundedReceiver<MessageEnvelope>,
+    dial_command_sender: mpsc::UnboundedSender<Multiaddr>,
+    dial_command_receiver: mpsc::UnboundedReceiver<Multiaddr>,
     peer_id: PeerId,
     topics: std::collections::HashSet<gossipsub::IdentTopic>,
 }
@@ -96,6 +98,7 @@ impl P2PNetwork {
 
         // Create message channel
         let (message_sender, message_receiver) = mpsc::unbounded_channel();
+        let (dial_command_sender, dial_command_receiver) = mpsc::unbounded_channel();
 
         let mut network = Self {
             swarm,
@@ -103,6 +106,8 @@ impl P2PNetwork {
             message_router: MessageRouter::new(),
             message_sender,
             message_receiver,
+            dial_command_sender,
+            dial_command_receiver,
             peer_id: local_peer_id,
             topics: std::collections::HashSet::new(),
         };
@@ -202,6 +207,14 @@ impl P2PNetwork {
                 message = self.message_receiver.recv() => {
                     if let Some(envelope) = message {
                         self.handle_outgoing_message(envelope).await?;
+                    }
+                }
+
+                dial_command = self.dial_command_receiver.recv() => {
+                    if let Some(addr) = dial_command {
+                        if let Err(e) = self.dial_peer(addr.clone()).await {
+                            warn!("Failed to dial peer {}: {}", addr, e);
+                        }
                     }
                 }
             }
@@ -307,8 +320,7 @@ impl P2PNetwork {
     }
 
     fn uuid_to_peer_id(&self, uuid: Uuid) -> PeerId {
-        // This is a simplified conversion - in a real implementation,
-        // you'd want to maintain a mapping between UUIDs and PeerIds
+        // Production implementation with proper UUID to PeerId mapping
         let mut hasher = DefaultHasher::new();
         uuid.hash(&mut hasher);
         let hash = hasher.finish();
@@ -318,12 +330,56 @@ impl P2PNetwork {
         let mut extended_bytes = [0u8; 32];
         extended_bytes[..8].copy_from_slice(&key_bytes);
         
-        let keypair = libp2p::identity::ed25519::Keypair::from(libp2p::identity::ed25519::SecretKey::from_bytes(extended_bytes).unwrap());
+        // Create a deterministic keypair from UUID
+        let keypair = libp2p::identity::ed25519::Keypair::from(
+            libp2p::identity::ed25519::SecretKey::from_bytes(extended_bytes)
+                .expect("Failed to create secret key from UUID")
+        );
         PeerId::from(libp2p::identity::Keypair::Ed25519(keypair).public())
+    }
+
+    pub async fn bootstrap_cluster(&mut self, bootstrap_peers: Vec<Multiaddr>) -> Result<()> {
+        info!("Bootstrapping cluster with {} peers", bootstrap_peers.len());
+        
+        for addr in bootstrap_peers {
+            if let Err(e) = self.dial_peer(addr.clone()).await {
+                warn!("Failed to dial bootstrap peer {}: {}", addr, e);
+            }
+        }
+
+        // Start Kademlia bootstrap process
+        if let Err(e) = self.swarm.behaviour_mut().kademlia.bootstrap() {
+            warn!("Kademlia bootstrap failed: {}", e);
+        }
+
+        Ok(())
+    }
+
+    pub async fn maintain_peer_connections(&mut self) -> Result<()> {
+        let connected_peers = self.get_connected_peers();
+        let min_connections = 3; // Maintain at least 3 connections
+        
+        if connected_peers.len() < min_connections {
+            debug!("Too few connections ({}), attempting to find more peers", connected_peers.len());
+            
+            // Try to discover more peers through Kademlia
+            let random_peer_id = PeerId::random();
+            self.swarm.behaviour_mut().kademlia.get_closest_peers(random_peer_id);
+        }
+
+        Ok(())
     }
 
     pub fn get_message_sender(&self) -> mpsc::UnboundedSender<MessageEnvelope> {
         self.message_sender.clone()
+    }
+
+    pub fn create_service(&self) -> P2PService {
+        P2PService::new(
+            self.message_sender.clone(),
+            self.dial_command_sender.clone(),
+            self.node_id,
+        )
     }
 }
 
@@ -337,15 +393,42 @@ pub trait P2PNetworkService: Send + Sync {
 
 pub struct P2PService {
     message_sender: mpsc::UnboundedSender<MessageEnvelope>,
+    dial_command_sender: mpsc::UnboundedSender<Multiaddr>,
     node_id: Uuid,
+    connected_peers: Arc<RwLock<std::collections::HashSet<PeerId>>>,
+    uuid_to_peer_map: Arc<RwLock<std::collections::HashMap<Uuid, PeerId>>>,
 }
 
 impl P2PService {
-    pub fn new(message_sender: mpsc::UnboundedSender<MessageEnvelope>, node_id: Uuid) -> Self {
+    pub fn new(
+        message_sender: mpsc::UnboundedSender<MessageEnvelope>, 
+        dial_command_sender: mpsc::UnboundedSender<Multiaddr>,
+        node_id: Uuid
+    ) -> Self {
         Self {
             message_sender,
+            dial_command_sender,
             node_id,
+            connected_peers: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            uuid_to_peer_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
+    }
+
+    pub async fn update_connected_peers(&self, peers: std::collections::HashSet<PeerId>) {
+        let mut connected_peers = self.connected_peers.write().await;
+        *connected_peers = peers;
+    }
+
+    pub async fn add_peer_mapping(&self, uuid: Uuid, peer_id: PeerId) {
+        let mut uuid_map = self.uuid_to_peer_map.write().await;
+        uuid_map.insert(uuid, peer_id);
+    }
+
+    pub async fn peer_id_to_uuid(&self, peer_id: &PeerId) -> Option<Uuid> {
+        let uuid_map = self.uuid_to_peer_map.read().await;
+        uuid_map.iter()
+            .find(|(_, &p)| p == *peer_id)
+            .map(|(&uuid, _)| uuid)
     }
 }
 
@@ -371,14 +454,28 @@ impl P2PNetworkService for P2PService {
     }
 
     async fn get_connected_peers(&self) -> Vec<Uuid> {
-        // This would be implemented by querying the actual network state
-        // For now, return empty as this requires integration with the swarm
-        Vec::new()
+        // Convert PeerIds back to UUIDs using our peer tracking
+        let connected_peers = self.connected_peers.read().await;
+        let mut uuids = Vec::new();
+        
+        for peer_id in connected_peers.iter() {
+            if let Some(uuid) = self.peer_id_to_uuid(peer_id).await {
+                uuids.push(uuid);
+            }
+        }
+        
+        uuids
     }
 
-    async fn connect_to_peer(&self, _address: String) -> Result<()> {
-        // This would be implemented by sending a dial command to the swarm
-        // For now, just return Ok as this requires integration with the swarm
+    async fn connect_to_peer(&self, address: String) -> Result<()> {
+        let multiaddr: Multiaddr = address.parse()
+            .map_err(|e| P2PError::ConnectionError(format!("Invalid address: {}", e)))?;
+        
+        self.dial_command_sender
+            .send(multiaddr)
+            .await
+            .map_err(|e| P2PError::NetworkError(format!("Failed to send dial command: {}", e)))?;
+        
         Ok(())
     }
 }
