@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
     }
 
     // Create client
-    let client = PulseClient::new(config).await?;
+    let client = PulseClient::new(config.clone()).await?;
 
     // Execute command
     match args.command {

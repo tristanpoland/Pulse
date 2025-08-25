@@ -56,5 +56,8 @@ rand = "0.8"
 parking_lot = "0.12"
 tempfile = "3.12"
 
+# Regex
+regex = "1.10"
+
 [workspace.dev-dependencies]
 tokio-test = "0.4"
