@@ -1,0 +1,148 @@
+name: Retry and Fault Tolerance Example
+version: "1.0"
+description: Demonstrates comprehensive retry mechanisms with state persistence
+
+on:
+  event: push
+
+env:
+  MAX_RETRIES: "5"
+  RETRY_DELAY: "30"
+
+jobs:
+  build:
+    name: Build with Retry
+    runs-on: ["build-servers"]
+    steps:
+      - name: Checkout with retry
+        uses: actions/checkout@v4
+        with:
+          repository: "https://github.com/example/myapp.git"
+        retry:
+          max_attempts: 3
+          delay_seconds: 10
+          exponential_backoff: true
+          backoff_multiplier: 2
+          max_delay_seconds: 300
+          retry_on:
+            - network_error
+            - timeout
+            - exit_codes: [1, 2, 130]
+          
+      - name: Install dependencies with advanced retry
+        run: |
+          npm ci --only=production
+          npm run build
+        timeout_minutes: 15
+        retry:
+          max_attempts: 5
+          delay_seconds: 30
+          exponential_backoff: true
+          backoff_multiplier: 1.5
+          jitter: true  # Add randomness to avoid thundering herd
+          retry_on:
+            - network_error
+            - timeout
+            - exit_codes: [1, 7, 130]
+            - output_contains: ["ENOTFOUND", "ETIMEDOUT", "network"]
+          persist_state: true  # Keep working directory and outputs between retries
+          
+      - name: Run flaky tests
+        run: |
+          npm run test:integration
+        retry:
+          max_attempts: 3
+          delay_seconds: 5
+          strategy: "immediate"  # no delay for first retry
+          retry_on:
+            - exit_codes: [1]
+            - output_contains: ["test timeout", "connection refused"]
+          persist_state: false  # Clean state for each test retry
+          
+      - name: Upload with circuit breaker
+        run: |
+          ./scripts/upload.sh
+        retry:
+          max_attempts: 10
+          delay_seconds: 60
+          circuit_breaker:
+            enabled: true
+            failure_threshold: 5
+            recovery_timeout_seconds: 300
+          retry_on:
+            - network_error
+            - exit_codes: [1, 2, 7]
+          persist_state: true
+          
+        outputs:
+          build_id: ${{ steps.build_upload.outputs.id }}
+          artifact_url: ${{ steps.build_upload.outputs.url }}
+
+  deploy:
+    name: Deploy with Conditional Retry
+    runs-on: ["deployment"]
+    needs: ["build"]
+    steps:
+      - name: Deploy to staging
+        run: |
+          echo "Deploying build ${{ needs.build.outputs.build_id }}"
+          ./deploy.sh staging
+        retry:
+          max_attempts: 3
+          delay_seconds: 120
+          conditions:
+            # Only retry on specific conditions
+            - if: "env.ENVIRONMENT == 'staging'"
+              max_attempts: 5
+            - if: "failure() && contains(steps.deploy.outputs.stderr, 'rate limit')"
+              delay_seconds: 300
+          retry_on:
+            - exit_codes: [1, 7]
+            - output_contains: ["deployment failed", "rate limit"]
+          persist_state: true
+          
+      - name: Health check with timeout
+        run: |
+          curl -f https://staging.example.com/health
+        retry:
+          max_attempts: 20
+          delay_seconds: 30
+          timeout_minutes: 1
+          retry_on:
+            - network_error
+            - timeout
+            - exit_codes: [1, 7, 22, 28]  # curl error codes
+          stop_on_success: true  # Stop retrying once successful
+
+  notification:
+    name: Send Notifications
+    runs-on: ["utility"]
+    needs: ["deploy"]
+    if_condition: "always()"  # Run even if deploy fails
+    steps:
+      - name: Notify success
+        if: "success()"
+        run: |
+          curl -X POST "${{ secrets.WEBHOOK_URL }}" \
+            -d '{"status": "success", "build": "${{ needs.build.outputs.build_id }}"}'
+        retry:
+          max_attempts: 3
+          delay_seconds: 10
+          retry_on:
+            - network_error
+            - exit_codes: [1, 7, 22]
+            
+      - name: Notify failure  
+        if: "failure()"
+        run: |
+          curl -X POST "${{ secrets.WEBHOOK_URL }}" \
+            -d '{"status": "failure", "error": "${{ steps.deploy.outputs.error }}"}'
+        retry:
+          max_attempts: 5
+          delay_seconds: 30
+          exponential_backoff: true
+          retry_on:
+            - network_error
+            - exit_codes: [1, 7, 22]
+          # Critical notifications should never give up
+          never_give_up: true
