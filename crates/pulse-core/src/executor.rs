@@ -26,8 +26,8 @@ pub struct ExecutionContext {
     pub job_id: Uuid,
     pub worker_id: Uuid,
     pub environment: HashMap<String, String>,
-    pub task_outputs: HashMap<String, serde_json::Value>,
-    pub secrets: HashMap<String, String>,
+    pub task_outputs: HashMap<String, HashMap<String, serde_json::Value>>, // task_id -> outputs
+    pub secrets: HashMap<String, crate::SecretManager>, // namespace -> secrets
     pub working_directory: String,
 }
 
@@ -35,18 +35,10 @@ pub struct ExecutionContext {
 pub struct TaskExecutionResult {
     pub success: bool,
     pub exit_code: Option<i32>,
-    pub output: Option<serde_json::Value>,
+    pub output: Option<HashMap<String, serde_json::Value>>, // Named outputs for data passing
     pub error_message: Option<String>,
     pub duration_ms: u64,
-    pub artifacts: Vec<ExecutionArtifact>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionArtifact {
-    pub name: String,
-    pub path: String,
-    pub size_bytes: u64,
-    pub content_type: Option<String>,
+    pub artifacts: Vec<crate::Artifact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

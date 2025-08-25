@@ -13,12 +13,14 @@ use crate::{
     docker::{CheckoutActionExecutor, DockerActionExecutor},
     error::{ExecutorError, Result},
     shell::{ShellActionExecutor, ShellExecutor},
+    artifact_manager::ArtifactManager,
 };
 
 pub struct DistributedTaskExecutor {
     shell_executor: ShellExecutor,
     action_registry: ExecutorRegistry,
     running_tasks: Arc<RwLock<HashMap<Uuid, RunningTask>>>,
+    artifact_manager: Arc<ArtifactManager>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,9 +34,13 @@ struct RunningTask {
 }
 
 impl DistributedTaskExecutor {
-    pub async fn new(working_directory: String) -> Self {
-        let shell_executor = ShellExecutor::new(working_directory);
+    pub async fn new(working_directory: String) -> Result<Self> {
+        let shell_executor = ShellExecutor::new(working_directory.clone());
         let mut action_registry = ExecutorRegistry::new();
+
+        // Create artifacts directory
+        let artifacts_dir = std::path::Path::new(&working_directory).join("artifacts");
+        let artifact_manager = Arc::new(ArtifactManager::new(artifacts_dir).await?);
 
         // Register built-in action executors
         action_registry.register_executor(
@@ -52,11 +58,12 @@ impl DistributedTaskExecutor {
             Box::new(CheckoutActionExecutor::new()),
         );
 
-        Self {
+        Ok(Self {
             shell_executor,
             action_registry,
             running_tasks: Arc::new(RwLock::new(HashMap::new())),
-        }
+            artifact_manager,
+        })
     }
 
     pub fn register_action_executor(
@@ -79,19 +86,67 @@ impl DistributedTaskExecutor {
 
         debug!("Executing action task: {} with action: {}", task.id, action);
 
+        // Prepare execution context with dependency outputs
+        let mut enhanced_context = self.artifact_manager
+            .prepare_execution_context(context.clone(), &task.needs)
+            .await?;
+
+        // Resolve secrets in environment and parameters
+        if let Some(secrets) = enhanced_context.secrets.get("default") {
+            enhanced_context.environment = pulse_core::resolve_env_secrets(
+                enhanced_context.environment.clone(), 
+                secrets
+            );
+            
+            // Resolve secrets in task environment
+            let task_env = pulse_core::resolve_env_secrets(task.environment.clone(), secrets);
+            enhanced_context.environment.extend(task_env);
+        }
+
         // Find appropriate executor
         let executor = self.action_registry.get_executor(action).ok_or_else(|| {
             ExecutorError::ActionNotFound { action: action.clone() }
         })?;
 
-        // Prepare parameters
-        let parameters = task.with.clone().unwrap_or_default();
+        // Prepare parameters (with secret resolution)
+        let mut parameters = task.with.clone().unwrap_or_default();
+        if let Some(secrets) = enhanced_context.secrets.get("default") {
+            for (key, value) in parameters.iter_mut() {
+                if let serde_json::Value::String(s) = value {
+                    *s = pulse_core::resolve_secrets(s, secrets);
+                }
+            }
+        }
 
         // Execute the action
-        execution.start(context.worker_id);
+        execution.start(enhanced_context.worker_id);
         
-        match executor.execute_action(action, &parameters, context).await {
-            Ok(result) => {
+        match executor.execute_action(action, &parameters, &enhanced_context).await {
+            Ok(mut result) => {
+                // Collect artifacts if specified
+                if let Some(artifact_patterns) = task.artifact_paths.as_ref() {
+                    match self.artifact_manager.collect_artifacts(execution, &enhanced_context, artifact_patterns).await {
+                        Ok(artifacts) => {
+                            result.artifacts = artifacts;
+                            debug!("Collected {} artifacts for task {}", result.artifacts.len(), task.id);
+                        }
+                        Err(e) => {
+                            warn!("Failed to collect artifacts for task {}: {}", task.id, e);
+                        }
+                    }
+                }
+
+                // Store task outputs for data passing
+                if let Some(outputs) = &result.output {
+                    for (output_name, output_value) in outputs {
+                        if let Err(e) = self.artifact_manager
+                            .store_task_output(&task.id, output_name, output_value.clone()).await 
+                        {
+                            warn!("Failed to store task output {}:{}: {}", task.id, output_name, e);
+                        }
+                    }
+                }
+
                 if result.success {
                     execution.complete(result.output.clone());
                 } else {
@@ -275,18 +330,18 @@ pub struct ExecutorPool {
 }
 
 impl ExecutorPool {
-    pub async fn new(pool_size: usize, working_directory: String) -> Self {
+    pub async fn new(pool_size: usize, working_directory: String) -> Result<Self> {
         let mut executors = Vec::with_capacity(pool_size);
         
         for _ in 0..pool_size {
-            let executor = Arc::new(DistributedTaskExecutor::new(working_directory.clone()).await);
+            let executor = Arc::new(DistributedTaskExecutor::new(working_directory.clone()).await?);
             executors.push(executor);
         }
 
-        Self {
+        Ok(Self {
             executors,
             round_robin_index: Arc::new(RwLock::new(0)),
-        }
+        })
     }
 
     pub async fn get_executor(&self) -> Arc<DistributedTaskExecutor> {
@@ -367,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn test_distributed_executor_creation() {
         let temp_dir = tempdir().unwrap();
-        let executor = DistributedTaskExecutor::new(temp_dir.path().to_string_lossy().to_string()).await;
+        let executor = DistributedTaskExecutor::new(temp_dir.path().to_string_lossy().to_string()).await.unwrap();
         
         assert_eq!(executor.get_task_count().await, 0);
     }
@@ -375,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn test_shell_command_execution() {
         let temp_dir = tempdir().unwrap();
-        let executor = DistributedTaskExecutor::new(temp_dir.path().to_string_lossy().to_string()).await;
+        let executor = DistributedTaskExecutor::new(temp_dir.path().to_string_lossy().to_string()).await.unwrap();
         
         let task = TaskDefinition::new("test_task", "Test Task")
             .with_command(vec!["echo".to_string(), "hello world".to_string()]);
@@ -392,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn test_action_execution() {
         let temp_dir = tempdir().unwrap();
-        let executor = DistributedTaskExecutor::new(temp_dir.path().to_string_lossy().to_string()).await;
+        let executor = DistributedTaskExecutor::new(temp_dir.path().to_string_lossy().to_string()).await.unwrap();
         
         let mut with_params = HashMap::new();
         with_params.insert("repository".to_string(), serde_json::Value::String("https://github.com/example/test.git".to_string()));
@@ -408,6 +463,8 @@ mod tests {
             needs: Vec::new(),
             uses: Some("actions/checkout@v4".to_string()),
             with: Some(with_params),
+            artifact_paths: None,
+            outputs: None,
         };
 
         let mut execution = TaskExecution::new(Uuid::new_v4(), &task);

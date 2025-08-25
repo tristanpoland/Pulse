@@ -38,6 +38,8 @@ pub struct TaskDefinition {
     pub needs: Vec<String>, // Tasks this task needs to complete first
     pub uses: Option<String>, // Action to use (like GitHub Actions)
     pub with: Option<HashMap<String, serde_json::Value>>, // Parameters for the action
+    pub artifact_paths: Option<Vec<String>>, // Paths/patterns for artifact collection
+    pub outputs: Option<HashMap<String, String>>, // Output definitions for data passing
 }
 
 impl TaskExecution {
@@ -106,6 +108,8 @@ impl TaskDefinition {
             needs: Vec::new(),
             uses: None,
             with: None,
+            artifact_paths: None,
+            outputs: None,
         }
     }
 
@@ -136,6 +140,16 @@ impl TaskDefinition {
 
     pub fn with_retry_limit(mut self, limit: u32) -> Self {
         self.retry_limit = limit;
+        self
+    }
+
+    pub fn with_artifacts(mut self, paths: Vec<String>) -> Self {
+        self.artifact_paths = Some(paths);
+        self
+    }
+
+    pub fn with_outputs(mut self, outputs: HashMap<String, String>) -> Self {
+        self.outputs = Some(outputs);
         self
     }
 }
