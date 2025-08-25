@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Secret storage and management for workflows
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretManager {
     secrets: HashMap<String, SecretValue>,
     namespace: String,
