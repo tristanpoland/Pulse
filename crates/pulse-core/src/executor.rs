@@ -73,6 +73,48 @@ impl From<ExecutionArtifact> for crate::Artifact {
     }
 }
 
+#[cfg(test)]
+mod execution_artifact_tests {
+    use super::*;
+    
+    #[test]
+    fn test_execution_artifact_conversion() {
+        let exec_artifact = ExecutionArtifact {
+            name: "test.txt".to_string(),
+            path: "/path/to/test.txt".to_string(),
+            size_bytes: 1024,
+            content_type: Some("text/plain".to_string()),
+        };
+
+        let task_id = Uuid::new_v4();
+        let artifact = exec_artifact.to_artifact(task_id);
+
+        assert_eq!(artifact.name, "test.txt");
+        assert_eq!(artifact.path, "/path/to/test.txt");
+        assert_eq!(artifact.size_bytes, 1024);
+        assert_eq!(artifact.task_execution_id, task_id);
+        assert_eq!(artifact.artifact_type, crate::ArtifactType::File);
+        assert_eq!(artifact.metadata.get("content_type"), Some(&"text/plain".to_string()));
+    }
+
+    #[test]
+    fn test_execution_artifact_from_conversion() {
+        let exec_artifact = ExecutionArtifact {
+            name: "log.txt".to_string(),
+            path: "/path/to/log.txt".to_string(),
+            size_bytes: 512,
+            content_type: None,
+        };
+
+        let artifact: crate::Artifact = exec_artifact.into();
+        assert_eq!(artifact.name, "log.txt");
+        assert_eq!(artifact.path, "/path/to/log.txt");
+        assert_eq!(artifact.size_bytes, 512);
+        assert_eq!(artifact.artifact_type, crate::ArtifactType::File);
+        assert_eq!(artifact.metadata.get("content_type"), Some(&"".to_string()));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskExecutionStatus {
     Pending,
