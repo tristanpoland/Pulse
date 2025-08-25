@@ -1,0 +1,80 @@
+name: Simple CI Pipeline
+version: "1.0"
+description: A basic CI pipeline that builds and tests an application
+
+on:
+  event: push
+
+env:
+  NODE_VERSION: "18"
+  BUILD_ENV: "production"
+
+jobs:
+  checkout:
+    name: Checkout Code
+    runs-on: ["ubuntu-latest"]
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          repository: "https://github.com/example/myapp.git"
+          ref: main
+
+  build:
+    name: Build Application
+    runs-on: ["build-capable"]
+    needs: ["checkout"]
+    steps:
+      - name: Install dependencies
+        run: |
+          echo "Installing Node.js dependencies..."
+          npm ci --only=production
+          
+      - name: Build application
+        run: |
+          echo "Building application..."
+          npm run build
+        timeout_minutes: 10
+
+      - name: Create build artifact
+        run: |
+          tar -czf build-artifact.tar.gz dist/
+          echo "Build artifact created"
+
+  test:
+    name: Run Tests
+    runs-on: ["test-runner"]
+    needs: ["checkout"]
+    steps:
+      - name: Install test dependencies
+        run: |
+          npm ci
+          
+      - name: Run unit tests
+        run: |
+          echo "Running unit tests..."
+          npm run test:unit
+        continue_on_error: false
+
+      - name: Run integration tests
+        run: |
+          echo "Running integration tests..."
+          npm run test:integration
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgres://test:test@localhost:5432/testdb
+
+  deploy:
+    name: Deploy to Staging
+    runs-on: ["deployment-server"]
+    needs: ["build", "test"]
+    if_condition: "success()"
+    steps:
+      - name: Deploy application
+        run: |
+          echo "Deploying application to staging..."
+          ./scripts/deploy.sh staging
+        timeout_minutes: 15
+        env:
+          DEPLOY_ENV: staging
+          API_KEY: ${{ secrets.STAGING_API_KEY }}

@@ -1,0 +1,262 @@
+name: Complex Multi-Stage Pipeline
+version: "1.0"
+description: A comprehensive pipeline with parallel execution and multiple environments
+
+on:
+  event: push
+
+env:
+  APP_NAME: "myapp"
+  BUILD_NUMBER: ${{ github.run_number }}
+  ARTIFACT_BUCKET: "pulse-artifacts"
+
+jobs:
+  # Code Quality and Security
+  lint-and-security:
+    name: Code Quality & Security
+    runs-on: ["code-analysis"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: |
+          npm run lint
+          npm run lint:fix
+        continue_on_error: false
+
+      - name: Run Prettier
+        run: npm run format:check
+
+      - name: Security audit
+        run: |
+          npm audit --audit-level high
+          npm run security:check
+
+      - name: Static analysis
+        run: |
+          npm run analyze
+          sonar-scanner || echo "SonarQube analysis completed"
+
+  # Unit Tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ["test-runner"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: |
+          npm run test:unit -- --coverage --maxWorkers=2
+        env:
+          NODE_ENV: test
+          CI: "true"
+
+      - name: Upload coverage
+        run: |
+          curl -s https://codecov.io/bash | bash -s -- -t ${CODECOV_TOKEN}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # Build Frontend
+  build-frontend:
+    name: Build Frontend
+    runs-on: ["build-server"]
+    needs: ["lint-and-security"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        run: |
+          curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+
+      - name: Cache node modules
+        run: |
+          mkdir -p ~/.npm-cache
+          npm config set cache ~/.npm-cache
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci --cache ~/.npm-cache
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm run build:prod
+        env:
+          NODE_ENV: production
+          API_URL: https://api.example.com
+
+      - name: Optimize assets
+        run: |
+          cd frontend
+          npm run optimize
+          gzip -r dist/
+
+  # Build Backend
+  build-backend:
+    name: Build Backend
+    runs-on: ["build-server"]
+    needs: ["lint-and-security"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build backend services
+        run: |
+          cd backend
+          npm ci
+          npm run build
+          npm run compile:typescript
+
+      - name: Create deployment package
+        run: |
+          cd backend
+          tar -czf ../backend-${BUILD_NUMBER}.tar.gz dist/ package.json package-lock.json
+
+  # Integration Tests
+  integration-tests:
+    name: Integration Tests
+    runs-on: ["integration-test"]
+    needs: ["build-frontend", "build-backend"]
+    steps:
+      - name: Start test services
+        run: |
+          docker-compose -f docker-compose.test.yml up -d
+          sleep 30  # Wait for services to start
+
+      - name: Run API tests
+        run: |
+          npm run test:api
+        env:
+          API_BASE_URL: http://localhost:3000
+          DATABASE_URL: postgres://test:test@localhost:5432/testdb
+
+      - name: Run E2E tests
+        run: |
+          npm run test:e2e -- --headless
+        env:
+          FRONTEND_URL: http://localhost:8080
+          BACKEND_URL: http://localhost:3000
+
+      - name: Cleanup test services
+        run: |
+          docker-compose -f docker-compose.test.yml down -v
+        if_condition: "always()"
+
+  # Performance Tests
+  performance-tests:
+    name: Performance Tests
+    runs-on: ["performance-test"]
+    needs: ["integration-tests"]
+    steps:
+      - name: Setup performance test environment
+        run: |
+          docker run -d --name loadtest-target -p 9090:3000 myapp:latest
+          sleep 10
+
+      - name: Run load tests
+        run: |
+          k6 run --vus 10 --duration 30s loadtest.js
+        env:
+          TARGET_URL: http://localhost:9090
+
+      - name: Run stress tests
+        run: |
+          artillery run artillery-config.yml
+
+      - name: Cleanup performance environment
+        run: |
+          docker stop loadtest-target
+          docker rm loadtest-target
+
+  # Security Tests
+  security-tests:
+    name: Security Tests
+    runs-on: ["security-test"]
+    needs: ["build-frontend", "build-backend"]
+    steps:
+      - name: OWASP ZAP scan
+        uses: docker
+        with:
+          image: "owasp/zap2docker-stable:latest"
+          run: |
+            zap-baseline.py -t http://localhost:8080 -J zap-report.json
+
+      - name: Dependency vulnerability scan
+        run: |
+          npm audit --json > audit-report.json
+          snyk test --json > snyk-report.json
+
+  # Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ["staging-deployment"]
+    needs: ["integration-tests", "performance-tests", "security-tests"]
+    if_condition: "success() && github.ref == 'refs/heads/main'"
+    steps:
+      - name: Deploy frontend to CDN
+        run: |
+          aws s3 sync frontend/dist/ s3://${STAGING_BUCKET}/
+          aws cloudfront create-invalidation --distribution-id ${STAGING_CDN_ID} --paths "/*"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          STAGING_BUCKET: staging-myapp-frontend
+          STAGING_CDN_ID: ${{ secrets.STAGING_CDN_ID }}
+
+      - name: Deploy backend to staging
+        run: |
+          kubectl config use-context staging
+          kubectl set image deployment/myapp-backend backend=myapp:${BUILD_NUMBER}
+          kubectl rollout status deployment/myapp-backend --timeout=300s
+
+      - name: Run smoke tests
+        run: |
+          ./scripts/smoke-tests.sh https://staging-api.example.com
+
+  # Production Deployment
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ["production-deployment"]
+    needs: ["deploy-staging"]
+    if_condition: "success() && github.ref == 'refs/heads/main'"
+    steps:
+      - name: Manual approval gate
+        run: |
+          echo "Waiting for manual approval..."
+          # In a real system, this would pause for human approval
+
+      - name: Blue-Green deployment
+        run: |
+          ./scripts/blue-green-deploy.sh ${BUILD_NUMBER}
+        timeout_minutes: 30
+
+      - name: Health checks
+        run: |
+          ./scripts/health-check.sh https://api.example.com
+          ./scripts/health-check.sh https://example.com
+
+      - name: Update monitoring
+        run: |
+          curl -X POST "${DATADOG_API_URL}/events" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${DATADOG_API_KEY}" \
+            -d '{
+              "title": "Production Deployment",
+              "text": "Successfully deployed build '${BUILD_NUMBER}' to production",
+              "tags": ["deployment", "production", "myapp"]
+            }'
+        env:
+          DATADOG_API_URL: https://api.datadoghq.com/api/v1
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}

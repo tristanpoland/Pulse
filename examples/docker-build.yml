@@ -1,0 +1,106 @@
+name: Docker Build Pipeline
+version: "1.0"
+description: Build and test a containerized application
+
+on:
+  event: push
+
+env:
+  DOCKER_REGISTRY: "ghcr.io/example"
+  IMAGE_NAME: "myapp"
+
+jobs:
+  build-image:
+    name: Build Docker Image
+    runs-on: ["docker-enabled"]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: "https://github.com/example/docker-app.git"
+
+      - name: Build Docker image
+        uses: docker
+        with:
+          image: "docker:latest"
+          run: |
+            docker build -t ${IMAGE_NAME}:latest .
+            docker tag ${IMAGE_NAME}:latest ${IMAGE_NAME}:${GITHUB_SHA}
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - name: Test image builds correctly
+        uses: docker
+        with:
+          image: "docker:latest"
+          run: |
+            docker run --rm ${IMAGE_NAME}:latest --version
+            echo "Image smoke test passed"
+
+  security-scan:
+    name: Security Scan
+    runs-on: ["security-scanner"]
+    needs: ["build-image"]
+    steps:
+      - name: Run vulnerability scan
+        uses: docker
+        with:
+          image: "aquasec/trivy:latest"
+          run: |
+            trivy image --exit-code 1 --severity HIGH,CRITICAL ${IMAGE_NAME}:latest
+
+  integration-test:
+    name: Integration Tests
+    runs-on: ["docker-enabled"]
+    needs: ["build-image"]
+    steps:
+      - name: Start test database
+        uses: docker
+        with:
+          image: "postgres:13"
+          ports: ["5432:5432"]
+          env:
+            POSTGRES_PASSWORD: testpass
+            POSTGRES_DB: testdb
+
+      - name: Run integration tests
+        uses: docker
+        with:
+          image: "${IMAGE_NAME}:latest"
+          run: |
+            # Wait for database to be ready
+            sleep 10
+            # Run tests
+            npm run test:integration
+          env:
+            DATABASE_URL: postgres://postgres:testpass@localhost:5432/testdb
+            NODE_ENV: test
+
+  push-image:
+    name: Push to Registry
+    runs-on: ["docker-enabled"]
+    needs: ["security-scan", "integration-test"]
+    if_condition: "success()"
+    steps:
+      - name: Login to registry
+        uses: docker
+        with:
+          image: "docker:latest"
+          run: |
+            echo "${REGISTRY_TOKEN}" | docker login ghcr.io -u ${REGISTRY_USER} --password-stdin
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Push images
+        uses: docker
+        with:
+          image: "docker:latest"
+          run: |
+            docker tag ${IMAGE_NAME}:latest ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest
+            docker tag ${IMAGE_NAME}:latest ${DOCKER_REGISTRY}/${IMAGE_NAME}:${GITHUB_SHA}
+            
+            docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest
+            docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${GITHUB_SHA}
+            
+            echo "Images pushed successfully"
