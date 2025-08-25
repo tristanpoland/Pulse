@@ -1,0 +1,541 @@
+name: Comprehensive Production Pipeline
+version: "1.0"
+description: |
+  A complete example demonstrating all Pulse workflow features:
+  - Secrets management and injection
+  - Artifact collection and data passing
+  - Advanced retry mechanisms with state persistence
+  - Distributed execution with fault tolerance
+  - Complex dependency graphs
+
+on:
+  event: push
+  branches: ["main", "develop"]
+
+env:
+  NODE_VERSION: "18"
+  BUILD_ENV: "production"
+  DOCKER_REGISTRY: "${{ secrets.DOCKER_REGISTRY }}"
+  NOTIFICATION_WEBHOOK: "${{ secrets.SLACK_WEBHOOK }}"
+
+secrets:
+  # Secrets are managed securely by the Pulse cluster
+  DOCKER_REGISTRY: "registry.example.com"
+  DOCKER_USERNAME: "ci-user"
+  DOCKER_PASSWORD: "secure-password-123"
+  DATABASE_URL: "postgres://user:pass@db.example.com:5432/myapp"
+  SLACK_WEBHOOK: "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+  SSH_PRIVATE_KEY: "-----BEGIN RSA PRIVATE KEY-----\n..."
+  API_TOKEN: "ghp_xxxxxxxxxxxxxxxxxxxx"
+
+jobs:
+  # Source code checkout and preparation
+  checkout:
+    name: "Checkout Source Code"
+    runs-on: ["source-control"]
+    timeout_minutes: 10
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          repository: "${{ github.repository }}"
+          ref: "${{ github.ref }}"
+          token: "${{ secrets.API_TOKEN }}"
+          depth: 0  # Full history for proper versioning
+        retry:
+          max_attempts: 5
+          delay_seconds: 10
+          exponential_backoff: true
+          backoff_multiplier: 1.5
+          retry_on:
+            - network_error
+            - timeout
+            - exit_codes: [1, 128]
+          persist_state: true
+        artifacts:
+          - "**/*.rs"
+          - "**/*.toml"
+          - "**/*.yml"
+          - "**/*.md"
+          - "scripts/**"
+        outputs:
+          commit_sha: "${{ github.sha }}"
+          branch_name: "${{ github.ref_name }}"
+          repo_name: "${{ github.repository }}"
+
+      - name: Generate build metadata
+        run: |
+          echo "BUILD_ID=$(date +%Y%m%d%H%M%S)-${GITHUB_SHA:0:8}" >> $GITHUB_OUTPUT
+          echo "BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+          echo "VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)" >> $GITHUB_OUTPUT
+        outputs:
+          build_id: "${{ steps.metadata.outputs.BUILD_ID }}"
+          build_timestamp: "${{ steps.metadata.outputs.BUILD_TIMESTAMP }}"
+          version: "${{ steps.metadata.outputs.VERSION }}"
+
+  # Dependency management and caching
+  dependencies:
+    name: "Install Dependencies"
+    runs-on: ["build-capable"]
+    needs: ["checkout"]
+    timeout_minutes: 20
+    steps:
+      - name: Setup Rust toolchain
+        uses: actions/setup-rust@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+        retry:
+          max_attempts: 3
+          delay_seconds: 30
+          retry_on:
+            - network_error
+            - exit_codes: [1]
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: "${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}"
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install dependencies
+        run: |
+          cargo fetch --locked
+          cargo build --release --workspace
+        env:
+          CARGO_NET_RETRY: 10
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+        retry:
+          max_attempts: 3
+          delay_seconds: 60
+          exponential_backoff: true
+          retry_on:
+            - network_error
+            - output_contains: ["error: failed to get", "Blocking waiting for file lock"]
+          persist_state: true
+        artifacts:
+          - "target/release/pulse-*"
+          - "Cargo.lock"
+        outputs:
+          dependencies_hash: "${{ hashFiles('**/Cargo.lock') }}"
+
+  # Code quality and security checks
+  quality_checks:
+    name: "Quality & Security Checks"
+    runs-on: ["security-scanner"]
+    needs: ["dependencies"]
+    timeout_minutes: 15
+    steps:
+      - name: Format check
+        run: cargo fmt -- --check
+        retry:
+          max_attempts: 2
+          delay_seconds: 5
+          strategy: "immediate"
+
+      - name: Lint with Clippy
+        run: |
+          cargo clippy --all-targets --all-features -- -D warnings
+        retry:
+          max_attempts: 2
+          delay_seconds: 10
+          retry_on:
+            - exit_codes: [101]  # Clippy error code
+
+      - name: Security audit
+        run: |
+          cargo install cargo-audit || true
+          cargo audit --ignore RUSTSEC-2020-0071
+        retry:
+          max_attempts: 5
+          delay_seconds: 30
+          circuit_breaker:
+            enabled: true
+            failure_threshold: 3
+            recovery_timeout_seconds: 300
+          retry_on:
+            - network_error
+            - exit_codes: [1]
+
+      - name: Vulnerability scan
+        run: |
+          cargo install cargo-deny || true
+          cargo deny check advisories
+        retry:
+          max_attempts: 3
+          delay_seconds: 45
+          retry_on:
+            - network_error
+        continue_on_error: true  # Don't fail the build on advisories
+
+  # Comprehensive test suite
+  test_suite:
+    name: "Test Suite"
+    runs-on: ["test-runners"]
+    needs: ["dependencies"]
+    timeout_minutes: 30
+    strategy:
+      matrix:
+        test_type: ["unit", "integration", "end-to-end"]
+    steps:
+      - name: "Run ${{ matrix.test_type }} tests"
+        run: |
+          case "${{ matrix.test_type }}" in
+            "unit")
+              cargo test --lib --bins
+              ;;
+            "integration") 
+              cargo test --test '*'
+              ;;
+            "end-to-end")
+              ./scripts/run-e2e-tests.sh
+              ;;
+          esac
+        env:
+          RUST_BACKTRACE: 1
+          DATABASE_URL: "${{ secrets.DATABASE_URL }}"
+        retry:
+          max_attempts: 3
+          delay_seconds: 30
+          retry_on:
+            - exit_codes: [1]
+            - output_contains: ["test result: FAILED", "connection refused"]
+          conditions:
+            - if: "matrix.test_type == 'end-to-end'"
+              max_attempts: 5
+              delay_seconds: 60
+          persist_state: false  # Clean state for each test retry
+        artifacts:
+          - "target/debug/deps/test-*"
+          - "test-results/**"
+          - "coverage/**"
+
+      - name: Generate test report
+        run: |
+          echo "TEST_TYPE=${{ matrix.test_type }}" >> $GITHUB_OUTPUT
+          echo "PASSED=$(grep -c "test result: ok" test-output.log)" >> $GITHUB_OUTPUT
+          echo "FAILED=$(grep -c "test result: FAILED" test-output.log)" >> $GITHUB_OUTPUT
+        outputs:
+          test_type: "${{ steps.report.outputs.TEST_TYPE }}"
+          passed: "${{ steps.report.outputs.PASSED }}"
+          failed: "${{ steps.report.outputs.FAILED }}"
+
+  # Build and package artifacts
+  build:
+    name: "Build & Package"
+    runs-on: ["build-servers"]
+    needs: ["quality_checks", "test_suite"]
+    timeout_minutes: 25
+    steps:
+      - name: Build release binaries
+        run: |
+          cargo build --release --workspace
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+        retry:
+          max_attempts: 2
+          delay_seconds: 120
+          retry_on:
+            - exit_codes: [101]  # Compilation error
+          persist_state: true
+
+      - name: Strip and compress binaries
+        run: |
+          strip target/release/pulse-*
+          upx --best target/release/pulse-* || true
+        continue_on_error: true
+
+      - name: Create distribution packages
+        run: |
+          mkdir -p dist/{linux,windows,macos}
+          cp target/release/pulse-cli dist/linux/
+          cp target/release/pulse-worker dist/linux/
+          tar -czf "pulse-${{ needs.checkout.outputs.version }}-linux-x86_64.tar.gz" -C dist/linux .
+        artifacts:
+          - "dist/**"
+          - "pulse-*.tar.gz"
+        outputs:
+          package_linux: "pulse-${{ needs.checkout.outputs.version }}-linux-x86_64.tar.gz"
+          binary_size: "${{ du -h target/release/pulse-cli | cut -f1 }}"
+
+  # Docker image build and registry push
+  docker_build:
+    name: "Build & Push Docker Images"
+    runs-on: ["docker-capable"]
+    needs: ["build"]
+    timeout_minutes: 20
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to container registry
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login "${{ secrets.DOCKER_REGISTRY }}" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+        retry:
+          max_attempts: 5
+          delay_seconds: 30
+          exponential_backoff: true
+          retry_on:
+            - network_error
+            - exit_codes: [1]
+            - output_contains: ["login failed", "unauthorized"]
+
+      - name: Build and push worker image
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            --tag "${{ secrets.DOCKER_REGISTRY }}/pulse-worker:${{ needs.checkout.outputs.version }}" \
+            --tag "${{ secrets.DOCKER_REGISTRY }}/pulse-worker:latest" \
+            --file docker/Dockerfile.worker \
+            .
+        retry:
+          max_attempts: 3
+          delay_seconds: 60
+          circuit_breaker:
+            enabled: true
+            failure_threshold: 2
+            recovery_timeout_seconds: 180
+          retry_on:
+            - network_error
+            - exit_codes: [1]
+          persist_state: true
+
+      - name: Build and push CLI image
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            --tag "${{ secrets.DOCKER_REGISTRY }}/pulse-cli:${{ needs.checkout.outputs.version }}" \
+            --tag "${{ secrets.DOCKER_REGISTRY }}/pulse-cli:latest" \
+            --file docker/Dockerfile.cli \
+            .
+        retry:
+          max_attempts: 3
+          delay_seconds: 60
+          retry_on:
+            - network_error
+            - exit_codes: [1]
+
+      - name: Scan images for vulnerabilities
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            "${{ secrets.DOCKER_REGISTRY }}/pulse-worker:${{ needs.checkout.outputs.version }}"
+        retry:
+          max_attempts: 2
+          delay_seconds: 30
+          retry_on:
+            - network_error
+        continue_on_error: true
+        outputs:
+          worker_image: "${{ secrets.DOCKER_REGISTRY }}/pulse-worker:${{ needs.checkout.outputs.version }}"
+          cli_image: "${{ secrets.DOCKER_REGISTRY }}/pulse-cli:${{ needs.checkout.outputs.version }}"
+
+  # Deployment to staging environment
+  deploy_staging:
+    name: "Deploy to Staging"
+    runs-on: ["deployment-staging"]
+    needs: ["docker_build"]
+    timeout_minutes: 15
+    environment: staging
+    steps:
+      - name: Setup deployment credentials
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan staging.example.com >> ~/.ssh/known_hosts
+
+      - name: Deploy to staging cluster
+        run: |
+          ssh deploy@staging.example.com "
+            cd /opt/pulse-staging &&
+            docker-compose pull &&
+            docker-compose up -d --force-recreate
+          "
+        env:
+          PULSE_WORKER_IMAGE: "${{ needs.docker_build.outputs.worker_image }}"
+          PULSE_CLI_IMAGE: "${{ needs.docker_build.outputs.cli_image }}"
+        retry:
+          max_attempts: 5
+          delay_seconds: 30
+          exponential_backoff: true
+          backoff_multiplier: 1.5
+          retry_on:
+            - network_error
+            - exit_codes: [1, 255]
+            - output_contains: ["connection refused", "timeout"]
+          persist_state: true
+
+      - name: Wait for staging deployment
+        run: |
+          for i in {1..10}; do
+            if curl -f https://staging-api.example.com/health; then
+              echo "Staging deployment successful"
+              exit 0
+            fi
+            echo "Waiting for staging to be ready... (attempt $i/10)"
+            sleep 30
+          done
+          exit 1
+        retry:
+          max_attempts: 3
+          delay_seconds: 60
+          stop_on_success: true
+
+  # Integration tests against staging
+  staging_tests:
+    name: "Staging Integration Tests"
+    runs-on: ["test-staging"]
+    needs: ["deploy_staging"]
+    timeout_minutes: 20
+    steps:
+      - name: Run smoke tests
+        run: |
+          ./scripts/smoke-tests.sh https://staging-api.example.com
+        retry:
+          max_attempts: 5
+          delay_seconds: 45
+          retry_on:
+            - exit_codes: [1]
+            - output_contains: ["test failed", "connection error"]
+
+      - name: Run integration test suite
+        run: |
+          pytest tests/integration/ --staging-url=https://staging-api.example.com
+        env:
+          TEST_DATABASE_URL: "${{ secrets.DATABASE_URL }}"
+        retry:
+          max_attempts: 3
+          delay_seconds: 60
+          retry_on:
+            - exit_codes: [1]
+          conditions:
+            - if: "failure() && contains(steps.integration.outputs.stderr, 'database')"
+              delay_seconds: 120
+
+      - name: Performance benchmarks
+        run: |
+          ./scripts/performance-tests.sh https://staging-api.example.com
+        retry:
+          max_attempts: 2
+          delay_seconds: 30
+        continue_on_error: true  # Don't fail deployment on perf issues
+        artifacts:
+          - "performance-results/**"
+
+  # Production deployment (only on main branch)
+  deploy_production:
+    name: "Deploy to Production"
+    runs-on: ["deployment-production"]
+    needs: ["staging_tests"]
+    if: "github.ref == 'refs/heads/main'"
+    timeout_minutes: 30
+    environment: production
+    steps:
+      - name: Blue-green deployment
+        run: |
+          ./scripts/blue-green-deploy.sh \
+            --image "${{ needs.docker_build.outputs.worker_image }}" \
+            --health-check https://api.example.com/health \
+            --rollback-on-failure
+        retry:
+          max_attempts: 3
+          delay_seconds: 300  # 5 minute delay between production deployment attempts
+          retry_on:
+            - exit_codes: [1]
+            - output_contains: ["deployment failed", "health check failed"]
+          never_give_up: false  # Don't retry forever on production
+        outputs:
+          deployment_id: "${{ steps.deploy.outputs.deployment_id }}"
+          old_version: "${{ steps.deploy.outputs.old_version }}"
+
+      - name: Database migrations
+        run: |
+          ./scripts/run-migrations.sh production
+        env:
+          DATABASE_URL: "${{ secrets.DATABASE_URL }}"
+        retry:
+          max_attempts: 2
+          delay_seconds: 60
+          retry_on:
+            - exit_codes: [1]
+
+      - name: Warm up production cache
+        run: |
+          ./scripts/cache-warmup.sh https://api.example.com
+        retry:
+          max_attempts: 3
+          delay_seconds: 30
+        continue_on_error: true
+
+  # Notification and cleanup
+  notification:
+    name: "Send Notifications"
+    runs-on: ["utility"]
+    needs: ["deploy_production", "staging_tests"]
+    if: "always()"
+    timeout_minutes: 5
+    steps:
+      - name: Notify success
+        if: "success()"
+        run: |
+          curl -X POST "${{ secrets.SLACK_WEBHOOK }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "🎉 Pulse deployment successful!",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  {"title": "Version", "value": "${{ needs.checkout.outputs.version }}", "short": true},
+                  {"title": "Commit", "value": "${{ needs.checkout.outputs.commit_sha }}", "short": true},
+                  {"title": "Branch", "value": "${{ needs.checkout.outputs.branch_name }}", "short": true},
+                  {"title": "Environment", "value": "Production", "short": true}
+                ]
+              }]
+            }'
+        retry:
+          max_attempts: 5
+          delay_seconds: 10
+          exponential_backoff: true
+          retry_on:
+            - network_error
+            - exit_codes: [1, 7, 22]
+
+      - name: Notify failure
+        if: "failure()"
+        run: |
+          curl -X POST "${{ secrets.SLACK_WEBHOOK }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "❌ Pulse deployment failed!",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  {"title": "Failed Job", "value": "${{ github.job }}", "short": true},
+                  {"title": "Commit", "value": "${{ needs.checkout.outputs.commit_sha }}", "short": true},
+                  {"title": "Branch", "value": "${{ needs.checkout.outputs.branch_name }}", "short": true},
+                  {"title": "Logs", "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "short": false}
+                ]
+              }]
+            }'
+        retry:
+          max_attempts: 10
+          delay_seconds: 30
+          exponential_backoff: true
+          never_give_up: true  # Critical notifications should always succeed
+
+      - name: Cleanup temporary artifacts
+        run: |
+          # Clean up temporary files and artifacts older than 7 days
+          find /tmp -name "pulse-*" -mtime +7 -delete || true
+          docker system prune -af --filter "until=168h" || true
+        continue_on_error: true
