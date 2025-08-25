@@ -34,7 +34,8 @@ pub struct TaskDefinition {
     pub dependencies: Vec<String>,
     pub environment: HashMap<String, String>,
     pub timeout_seconds: Option<u64>,
-    pub retry_limit: u32,
+    pub retry_limit: u32, // Deprecated - use retry_config instead
+    pub retry_config: Option<crate::RetryConfig>,
     pub needs: Vec<String>, // Tasks this task needs to complete first
     pub uses: Option<String>, // Action to use (like GitHub Actions)
     pub with: Option<HashMap<String, serde_json::Value>>, // Parameters for the action
@@ -105,6 +106,7 @@ impl TaskDefinition {
             environment: HashMap::new(),
             timeout_seconds: None,
             retry_limit: 3,
+            retry_config: None,
             needs: Vec::new(),
             uses: None,
             with: None,
@@ -150,6 +152,11 @@ impl TaskDefinition {
 
     pub fn with_outputs(mut self, outputs: HashMap<String, String>) -> Self {
         self.outputs = Some(outputs);
+        self
+    }
+
+    pub fn with_retry_config(mut self, config: crate::RetryConfig) -> Self {
+        self.retry_config = Some(config);
         self
     }
 }

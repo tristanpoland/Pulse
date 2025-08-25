@@ -6,6 +6,7 @@ pub mod storage;
 pub mod executor;
 pub mod cluster;
 pub mod secrets;
+pub mod retry;
 
 pub use error::*;
 pub use job::*;
@@ -15,3 +16,4 @@ pub use storage::*;
 pub use executor::*;
 pub use cluster::*;
 pub use secrets::*;
+pub use retry::*;
